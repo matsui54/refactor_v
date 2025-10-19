@@ -2,7 +2,9 @@
 import re
 import sys
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Sequence, Set, Tuple, Union
 
 BEGIN = r'// @extract-begin'
 END   = r'// @extract-end'
@@ -11,7 +13,56 @@ END   = r'// @extract-end'
 # Utility
 # --------------------------------------------------
 
-def read_module_src(mod_name, search_dirs):
+
+def strip_comments(text: str) -> str:
+    """Remove /* ... */ and // ... comments while preserving newlines."""
+    without_block = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    return re.sub(r'//.*', '', without_block)
+
+
+@dataclass
+class PortInfo:
+    direction: str
+    width: str = ""
+
+    def __iter__(self):
+        yield self.direction
+        yield self.width
+
+    def __eq__(self, other):
+        if isinstance(other, PortInfo):
+            return (self.direction, self.width) == (other.direction, other.width)
+        if isinstance(other, tuple):
+            return (self.direction, self.width) == other
+        return NotImplemented
+
+
+@dataclass
+class SignalRecord:
+    is_input: bool = False
+    is_output: bool = False
+    width: str = ""
+
+    def update_width(self, width: str) -> None:
+        width = width.strip()
+        if width and not self.width:
+            self.width = width
+
+    def mark_input(self, width: str) -> None:
+        if self.is_output:
+            return
+        self.is_input = True
+        self.update_width(width)
+
+    def clear_input(self) -> None:
+        self.is_input = False
+
+    def mark_output(self, width: str) -> None:
+        self.is_output = True
+        self.clear_input()
+        self.update_width(width)
+
+def read_module_src(mod_name: str, search_dirs: Union[Sequence[Union[str, Path]], str, Path]) -> str:
     """
     search_dirs 内から mod_name.(sv|v) を探索して読み込む。
     - 複数のディレクトリを順に探索
@@ -69,8 +120,7 @@ def parse_parent_decls(src: str):
 
 # -- ヘルパ: "a, b[3], /*c*/ d" → ["a", "b", "d"]
 def _split_ident_list(idlist: str):
-    s = re.sub(r'/\*.*?\*/', '', idlist, flags=re.S)  # /* */ コメント除去
-    s = re.sub(r'//.*', '', s)                        # // コメント除去
+    s = strip_comments(idlist)
     names = []
     for tok in re.split(r'\s*,\s*', s.strip()):
         base = re.split(r'\s|\[|=|\{', tok.strip())[0]  # unpacked/初期化子/添字を落とす
@@ -79,13 +129,14 @@ def _split_ident_list(idlist: str):
     return names
 
 # -- ヘルパ: "input|output|inout ..." 形式の宣言ブロックから辞書を取る
-def _collect_ports_from_decl(text: str, prefer='first'):
+def _collect_ports_from_decl(text: str, prefer: str = 'first') -> Tuple[Dict[str, PortInfo], List[str]]:
     """
     text 内にある input|output|inout 宣言を拾い、
     {port: (dir, width)} と order を返す。複数名 (a, b, c) 対応。
     prefer='first' のとき最初に見つけた定義を優先。
     """
-    port_dir, order = {}, []
+    port_dir: Dict[str, PortInfo] = {}
+    order: List[str] = []
     decl_re = re.compile(
         r'^\s*(input|output|inout)\b'     # 方向
         r'(?:\s+\w+)*'                    # 型/キーワード（logic, wire, reg, signed など）
@@ -96,18 +147,23 @@ def _collect_ports_from_decl(text: str, prefer='first'):
         d, width, idlist = m.groups()
         width = (width or '').strip()
         for name in _split_ident_list(idlist):
-            if name not in port_dir or prefer != 'first':
-                port_dir[name] = (d, width)
+            info = PortInfo(direction=d, width=width)
+            if name not in port_dir:
+                port_dir[name] = info
+                order.append(name)
+            elif prefer != 'first':
+                port_dir[name] = info
                 order.append(name)
     return port_dir, order
 
 # -- ヘッダの (...) 部分だけを抜き出してパース
-def _parse_ports_from_header(src: str):
+def _parse_ports_from_header(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
     module <name> ( ... ) ; の (...) を切り出し、
     方向トークン input|output|inout ごとにセグメント化 → 疑似 ; を付けて共通パーサへ。
     """
-    header_port_dir, header_order = {}, []
+    header_port_dir: Dict[str, PortInfo] = {}
+    header_order: List[str] = []
     mod_hdr_re = re.compile(r'module\s+[A-Za-z_]\w*\s*\((?P<plist>.*?)\)\s*;', re.S)
     mh = mod_hdr_re.search(src)
     if not mh:
@@ -130,12 +186,13 @@ def _parse_ports_from_header(src: str):
     return header_port_dir, header_order
 
 # -- 本体部（endmodule まで）から non-ANSI 宣言をパース
-def _parse_ports_from_body(src: str):
+def _parse_ports_from_body(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
     ヘッダ閉じ括弧 ');' 以降～対応する endmodule までを対象に、
     non-ANSI の input|output|inout 行を収集。
     """
-    body_port_dir, body_order = {}, []
+    body_port_dir: Dict[str, PortInfo] = {}
+    body_order: List[str] = []
     # まず最初の module のヘッダ終端を探す
     hdr_end = re.search(r'module\s+[A-Za-z_]\w*\s*\(.*?\)\s*;', src, flags=re.S)
     if hdr_end:
@@ -153,11 +210,12 @@ def _parse_ports_from_body(src: str):
     if em:
         body = body[:em.start()]
 
+    body = strip_comments(body)
     if body.strip():
         body_port_dir, body_order = _collect_ports_from_decl(body, prefer='first')
     return body_port_dir, body_order
 
-def parse_module_ports(src: str):
+def parse_module_ports(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
     1) ヘッダのポートリスト (ANSI) をパース
     2) モジュール内部の宣言 (non-ANSI) をパース
@@ -167,30 +225,35 @@ def parse_module_ports(src: str):
     header_dir, header_order = _parse_ports_from_header(src)
     body_dir,   body_order   = _parse_ports_from_body(src)
 
-    port_dir, order, seen = {}, [], set()
+    port_dir: Dict[str, PortInfo] = {}
+    order: List[str] = []
+    seen: Set[str] = set()
 
     # ヘッダ優先で追加
     for n in header_order:
         if n not in seen:
             port_dir[n] = header_dir[n]
-            order.append(n); seen.add(n)
+            order.append(n)
+            seen.add(n)
 
     # 本体から、未定義のものだけ追加
     for n in body_order:
         if n not in seen:
             port_dir[n] = body_dir[n]
-            order.append(n); seen.add(n)
+            order.append(n)
+            seen.add(n)
 
     return port_dir, order
 
 def find_instances(block_src: str):
     """ブロック内に現れるモジュールインスタンスのモジュール名集合"""
     mods = set()
-    for m in re.finditer(r'^\s*([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*\(', block_src, flags=re.M):
+    cleaned = strip_comments(block_src)
+    for m in re.finditer(r'^\s*([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*\(', cleaned, flags=re.M):
         mods.add(m.group(1))
     return mods
 
-def parse_instance_conns(block_src: str, mod_name: str):
+def parse_instance_conns(block_src: str, mod_name: str) -> Dict[str, Set[str]]:
     """
     インスタンスの .Port(expr) を {Port: set(base_signals)} に変換。
     expr は識別子単体、スライス、インデックス付き、単純演算を許容。
@@ -200,19 +263,19 @@ def parse_instance_conns(block_src: str, mod_name: str):
       .CCC(ccc_bit2)
       .DDD(a & b)
     """
-    out = {}
+    out: Dict[str, Set[str]] = {}
     inst_re = re.compile(
         rf'{mod_name}\s+[A-Za-z_]\w*\s*\(\s*(?P<body>.*?)\s*\)\s*;',
         re.S
     )
-    for im in inst_re.finditer(block_src):
-        body = im.group('body')
+    search_space = strip_comments(block_src)
+    for im in inst_re.finditer(search_space):
+        body = strip_comments(im.group('body'))
         # .Port(expr) を順に抽出
         for p in re.finditer(r'\.\s*([A-Za-z_]\w*)\s*\(\s*([^)]+?)\s*\)', body):
             port, expr = p.groups()
             # コメントを除去
-            expr = re.sub(r'/\*.*?\*/', '', expr, flags=re.S)
-            expr = re.sub(r'//.*', '', expr)
+            expr = strip_comments(expr)
 
             # 信号候補を抽出（識別子ベース部を取得）
             sigs = set()
@@ -223,16 +286,15 @@ def parse_instance_conns(block_src: str, mod_name: str):
                 out.setdefault(port, set()).update(sigs)
     return out
 
-def collect_assign_rw(block_src: str):
+def collect_assign_rw(block_src: str) -> Tuple[Set[str], Set[str]]:
     """
     assign 文から LHS 集合・RHS 集合（ベース名）を抽出する。
     LHS: assign LHS = ...
     RHS: 右辺に現れる識別子（スライス/添字付きはベース名に還元）
     """
-    lhs_set, rhs_set = set(), set()
-    # コメント除去
-    text = re.sub(r'/\*.*?\*/', '', block_src, flags=re.S)
-    text = re.sub(r'//.*', '', text)
+    lhs_set: Set[str] = set()
+    rhs_set: Set[str] = set()
+    text = strip_comments(block_src)
 
     # assign 行ごとに抽出（セミコロンで終わる）
     for m in re.finditer(r'^\s*assign\s+(.+?);\s*$', text, flags=re.M):
@@ -256,8 +318,7 @@ def collect_assign_rw(block_src: str):
 
 def extract_used_lines(outside_text: str) -> str:
     # コメント削除
-    text = re.sub(r'/\*.*?\*/', '', outside_text, flags=re.S)
-    text = re.sub(r'//.*', '', text)
+    text = strip_comments(outside_text)
 
     processed_lines = []
     for line in text.splitlines():
@@ -290,14 +351,14 @@ def token_used_outside(name: str, used_lines: str) -> bool:
 # Main extraction logic
 # --------------------------------------------------
 
-def resolve_width(sig, parent_decl, port_width):
-    if sig in parent_decl and parent_decl[sig]:
-        return parent_decl[sig]
-    if port_width:
-        return port_width
+def resolve_width(sig: str, parent_decl: Dict[str, str], port_width: str) -> str:
+    for candidate in (parent_decl.get(sig, ''), port_width or ''):
+        candidate = (candidate or '').strip()
+        if candidate:
+            return candidate
     return ''
 
-def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extracted_mod"):
+def gen_extracted_module_from_dirs(whole_src: str, search_dirs, new_mod_name: str = "extracted_mod") -> str:
     pre, block, post = split_with_markers(whole_src)
     outside = pre + post
     parent_decl = parse_parent_decls(whole_src)
@@ -305,13 +366,13 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
 
     # assign からの読み書き抽出
     lhs_assigned, rhs_used = collect_assign_rw(block)
-    assigned = lhs_assigned
+    assigned: Set[str] = set(lhs_assigned)
 
     # ブロック内のモジュール一覧
     mods = find_instances(block)
 
-    # 信号毎の集計テーブル: rec = {"in":bool, "out":bool, "width":str}
-    sig_table = {}
+    # 信号毎の集計テーブル
+    sig_table: Dict[str, SignalRecord] = {}
 
     # ① モジュール入出力からの推論
     for mod in mods:
@@ -319,23 +380,22 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
         port_dir, order = parse_module_ports(mod_src)
         conns = parse_instance_conns(block, mod)
 
-        for p in order:
-            if p not in port_dir:
+        for port_name in order:
+            port_info = port_dir.get(port_name)
+            if not port_info:
                 continue
-            direction, pw = port_dir[p]
-            for sig in conns.get(p, []):
+            for sig in conns.get(port_name, set()):
                 # 幅は 親宣言 > calleeポート
-                width = resolve_width(sig, parent_decl, pw)
-                rec = sig_table.setdefault(sig, {"in": False, "out": False, "width": width})
-                if direction == "input" and sig not in assigned:
-                    rec["in"] = True
-                elif direction == "output":
+                width = resolve_width(sig, parent_decl, port_info.width)
+                record = sig_table.setdefault(sig, SignalRecord())
+                if port_info.direction == "input" and sig not in assigned:
+                    record.mark_input(width)
+                elif port_info.direction == "output":
                     assigned.add(sig)
-                    rec["in"] = False
-                    if not rec["width"]:
-                        rec["width"] = width
+                    record.update_width(width)
+                    record.clear_input()
                     if token_used_outside(sig, used_lines):
-                        rec["out"] = True
+                        record.mark_output(width)
 
     # ② assign からの推論を統合
     # 入力: RHS に現れ、ブロック内で生成されていないもの
@@ -343,37 +403,34 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
         if sig in assigned:
             continue
         width = resolve_width(sig, parent_decl, '')
-        rec = sig_table.setdefault(sig, {"in": False, "out": False, "width": width})
-        rec["in"] = True
-        if not rec["width"]:
-            rec["width"] = width
+        record = sig_table.setdefault(sig, SignalRecord())
+        record.mark_input(width)
 
     # 出力: LHS に現れ、ブロック外で使用されているもののみ
     for sig in assigned:
         if token_used_outside(sig, used_lines):
             width = resolve_width(sig, parent_decl, '')
-            rec = sig_table.setdefault(sig, {"in": False, "out": False, "width": width})
-            rec["out"] = True
-            if not rec["width"]:
-                rec["width"] = width
+            record = sig_table.setdefault(sig, SignalRecord())
+            record.mark_output(width)
 
     # 最終 I/O 決定（output 優先で衝突解消）
-    inputs, outputs = [], []
-    for sig, rec in sig_table.items():
-        w = rec["width"]
-        if rec["out"]:
-            outputs.append((sig, w))
-        elif rec["in"]:
-            inputs.append((sig, w))
+    inputs: List[Tuple[str, str]] = []
+    outputs: List[Tuple[str, str]] = []
+    for sig, record in sig_table.items():
+        width = record.width
+        if record.is_output:
+            outputs.append((sig, width))
+        elif record.is_input:
+            inputs.append((sig, width))
 
     # assign LHS のうちポート化されないものはローカル宣言
-    port_names = {n for n,_ in inputs} | {n for n,_ in outputs}
+    port_names = {n for n, _ in inputs} | {n for n, _ in outputs}
     local_candidates = assigned - port_names
     local_decl = []
     for name in sorted(local_candidates):
         width = ''
-        if name in sig_table and sig_table[name]["width"]:
-            width = sig_table[name]["width"]
+        if name in sig_table and sig_table[name].width:
+            width = sig_table[name].width
         elif name in parent_decl and parent_decl[name]:
             width = parent_decl[name]
         width = width.strip()
@@ -388,13 +445,13 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
         decls.append(f"output {w+' ' if w else ''}{n}")
     header = f"module {new_mod_name}(\n    " + ",\n    ".join(decls) + "\n);\n"
 
-    body = block.strip("\n") + "\n"
-    return (
-        header
-        + ("    " + "\n    ".join(local_decl) + "\n" if local_decl else "")
-        + body.replace("\n", "\n")
-        + "endmodule\n"
-    )
+    body = block.strip("\n")
+    parts = [header]
+    if local_decl:
+        parts.append("    " + "\n    ".join(local_decl) + "\n")
+    parts.append(body + ("\n" if not body.endswith("\n") else ""))
+    parts.append("endmodule\n")
+    return "".join(parts)
 
 # --------------------------------------------------
 # CLI
