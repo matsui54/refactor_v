@@ -47,18 +47,18 @@ module top(input logic clk, input logic rst);
 
   // @inline-begin
   my_slice my_slice0(
-    .bus_in_hi,
-    ,.aaa,
-    ,.flag,
-    ,.bbb,
-    ,.ccc_bit2,
-    ,.ggg,
-    ,.ddd,
-    ,.bus_in,
-    ,.eee,
-    ,.fff,
-    ,.bus_out,
-    ,.w0,
+    .bus_in_hi
+    ,.aaa
+    ,.flag
+    ,.bbb
+    ,.ccc_bit2
+    ,.ggg
+    ,.ddd
+    ,.bus_in
+    ,.eee
+    ,.fff
+    ,.bus_out
+    ,.w0
     ,.w2
   );
   // @inline-end
@@ -72,7 +72,7 @@ module top(input logic clk, input logic rst);
   // ・eee と bus_out は参照される → 新モジュールの output に残すべき
   always_ff @(posedge clk) begin
     if (eee) begin
-      Z <= X + Y + bus_out + w2;
+        Z <= X + Y + bus_out + w2;
     end
   end
 

@@ -55,7 +55,7 @@ def parse_parent_decls(src: str):
     """親ファイル中の logic|wire|reg 宣言を抽出（幅辞書を作成）"""
     decls = {}
     decl_re = re.compile(
-        r'^\s*(wire|reg|logic)\b(?:\s+signed\b)?\s*(\[[^\]]+\])?\s+([^;]+);\s*$',
+        r'^\s*(wire|reg|logic)\b(?:\s+signed\b)?\s*(\[[^\]]+\])?\s*([^;]+);\s*$',
         re.M
     )
     for m in decl_re.finditer(src):
@@ -67,14 +67,120 @@ def parse_parent_decls(src: str):
                 decls[base] = width
     return decls
 
-def parse_module_ports(src: str):
-    """モジュール定義から {port: (dir,width)} を抽出（1行1宣言前提）"""
+# -- ヘルパ: "a, b[3], /*c*/ d" → ["a", "b", "d"]
+def _split_ident_list(idlist: str):
+    s = re.sub(r'/\*.*?\*/', '', idlist, flags=re.S)  # /* */ コメント除去
+    s = re.sub(r'//.*', '', s)                        # // コメント除去
+    names = []
+    for tok in re.split(r'\s*,\s*', s.strip()):
+        base = re.split(r'\s|\[|=|\{', tok.strip())[0]  # unpacked/初期化子/添字を落とす
+        if re.match(r'^[A-Za-z_]\w*$', base or ''):
+            names.append(base)
+    return names
+
+# -- ヘルパ: "input|output|inout ..." 形式の宣言ブロックから辞書を取る
+def _collect_ports_from_decl(text: str, prefer='first'):
+    """
+    text 内にある input|output|inout 宣言を拾い、
+    {port: (dir, width)} と order を返す。複数名 (a, b, c) 対応。
+    prefer='first' のとき最初に見つけた定義を優先。
+    """
     port_dir, order = {}, []
-    for m in re.finditer(r'^\s*(input|output)\s*(\[[^\]]+\])?\s*([A-Za-z_]\w*)\s*;\s*$',
-                         src, flags=re.M):
-        d, w, n = m.groups()
-        port_dir[n] = (d, w or '')
-        order.append(n)
+    decl_re = re.compile(
+        r'^\s*(input|output|inout)\b'     # 方向
+        r'(?:\s+\w+)*'                    # 型/キーワード（logic, wire, reg, signed など）
+        r'(?:\s*(\[[^\]]+\]))?'           # packed 幅（任意）
+        r'\s+([^;]+?)\s*;'                # ; までの識別子列
+        r'\s*$', re.M)
+    for m in decl_re.finditer(text):
+        d, width, idlist = m.groups()
+        width = (width or '').strip()
+        for name in _split_ident_list(idlist):
+            if name not in port_dir or prefer != 'first':
+                port_dir[name] = (d, width)
+                order.append(name)
+    return port_dir, order
+
+# -- ヘッダの (...) 部分だけを抜き出してパース
+def _parse_ports_from_header(src: str):
+    """
+    module <name> ( ... ) ; の (...) を切り出し、
+    方向トークン input|output|inout ごとにセグメント化 → 疑似 ; を付けて共通パーサへ。
+    """
+    header_port_dir, header_order = {}, []
+    mod_hdr_re = re.compile(r'module\s+[A-Za-z_]\w*\s*\((?P<plist>.*?)\)\s*;', re.S)
+    mh = mod_hdr_re.search(src)
+    if not mh:
+        return header_port_dir, header_order  # ヘッダ未検出（古い non-ANSI だけのケース）
+    plist = mh.group('plist')
+
+    # 方向キーワード境界でセグメント化
+    segs = []
+    tok_re = re.compile(r'(input|output|inout)\b', re.I)
+    positions = [m.start() for m in tok_re.finditer(plist)]
+    if positions:
+        positions.append(len(plist))
+        for i in range(len(positions)-1):
+            seg = plist[positions[i]:positions[i+1]]
+            segs.append(seg.strip() + ';')  # 疑似セミコロンを付与
+    header_text = "\n".join(segs)
+
+    if header_text.strip():
+        header_port_dir, header_order = _collect_ports_from_decl(header_text, prefer='first')
+    return header_port_dir, header_order
+
+# -- 本体部（endmodule まで）から non-ANSI 宣言をパース
+def _parse_ports_from_body(src: str):
+    """
+    ヘッダ閉じ括弧 ');' 以降～対応する endmodule までを対象に、
+    non-ANSI の input|output|inout 行を収集。
+    """
+    body_port_dir, body_order = {}, []
+    # まず最初の module のヘッダ終端を探す
+    hdr_end = re.search(r'module\s+[A-Za-z_]\w*\s*\(.*?\)\s*;', src, flags=re.S)
+    if hdr_end:
+        body = src[hdr_end.end():]
+    else:
+        # ヘッダ無し（module m;）のケースは全体を body として扱う
+        m0 = re.search(r'module\s+[A-Za-z_]\w*\s*;', src)
+        if m0:
+            body = src[m0.end():]
+        else:
+            body = src
+
+    # endmodule より先は切り落とす（最初の endmodule を想定）
+    em = re.search(r'\bendmodule\b', body)
+    if em:
+        body = body[:em.start()]
+
+    if body.strip():
+        body_port_dir, body_order = _collect_ports_from_decl(body, prefer='first')
+    return body_port_dir, body_order
+
+def parse_module_ports(src: str):
+    """
+    1) ヘッダのポートリスト (ANSI) をパース
+    2) モジュール内部の宣言 (non-ANSI) をパース
+    3) 最後に統合（**ヘッダ優先**）
+       戻り値: (port_dir: {name: (dir, width)}, order: [name...])
+    """
+    header_dir, header_order = _parse_ports_from_header(src)
+    body_dir,   body_order   = _parse_ports_from_body(src)
+
+    port_dir, order, seen = {}, [], set()
+
+    # ヘッダ優先で追加
+    for n in header_order:
+        if n not in seen:
+            port_dir[n] = header_dir[n]
+            order.append(n); seen.add(n)
+
+    # 本体から、未定義のものだけ追加
+    for n in body_order:
+        if n not in seen:
+            port_dir[n] = body_dir[n]
+            order.append(n); seen.add(n)
+
     return port_dir, order
 
 def find_instances(block_src: str):
@@ -148,14 +254,7 @@ def collect_assign_rw(block_src: str):
 
     return lhs_set, rhs_set
 
-def token_used_outside(name: str, outside_text: str) -> bool:
-    """
-    outside_text で name が使われているかを判定。
-    以下はカウントしない：
-      - コメント中（//, /* ... */）
-      - 宣言行の宣言部分 (wire|reg|logic)
-        - ただし宣言に初期化が付いている場合は RHS 内の使用は残す
-    """
+def extract_used_lines(outside_text: str) -> str:
     # コメント削除
     text = re.sub(r'/\*.*?\*/', '', outside_text, flags=re.S)
     text = re.sub(r'//.*', '', text)
@@ -174,9 +273,18 @@ def token_used_outside(name: str, outside_text: str) -> bool:
                 processed_lines.append('')
             continue
         processed_lines.append(line)
-    text = "\n".join(processed_lines)
+    return "\n".join(processed_lines)
 
-    return re.search(rf'\b{re.escape(name)}\b', text) is not None
+
+def token_used_outside(name: str, used_lines: str) -> bool:
+    """
+    outside_text で name が使われているかを判定。
+    以下はカウントしない：
+      - コメント中（//, /* ... */）
+      - 宣言行の宣言部分 (wire|reg|logic)
+        - ただし宣言に初期化が付いている場合は RHS 内の使用は残す
+    """
+    return re.search(rf'\b{re.escape(name)}\b', used_lines) is not None
 
 # --------------------------------------------------
 # Main extraction logic
@@ -193,6 +301,7 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
     pre, block, post = split_with_markers(whole_src)
     outside = pre + post
     parent_decl = parse_parent_decls(whole_src)
+    used_lines = extract_used_lines(outside)
 
     # assign からの読み書き抽出
     lhs_assigned, rhs_used = collect_assign_rw(block)
@@ -200,7 +309,6 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
 
     # ブロック内のモジュール一覧
     mods = find_instances(block)
-    produced_by_module = set()
 
     # 信号毎の集計テーブル: rec = {"in":bool, "out":bool, "width":str}
     sig_table = {}
@@ -222,10 +330,11 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
                 if direction == "input" and sig not in assigned:
                     rec["in"] = True
                 elif direction == "output":
-                    produced_by_module.add(sig)
+                    assigned.add(sig)
+                    rec["in"] = False
                     if not rec["width"]:
                         rec["width"] = width
-                    if token_used_outside(sig, outside):
+                    if token_used_outside(sig, used_lines):
                         rec["out"] = True
 
     # ② assign からの推論を統合
@@ -241,7 +350,7 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
 
     # 出力: LHS に現れ、ブロック外で使用されているもののみ
     for sig in assigned:
-        if token_used_outside(sig, outside):
+        if token_used_outside(sig, used_lines):
             width = resolve_width(sig, parent_decl, '')
             rec = sig_table.setdefault(sig, {"in": False, "out": False, "width": width})
             rec["out"] = True
@@ -259,7 +368,7 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
 
     # assign LHS のうちポート化されないものはローカル宣言
     port_names = {n for n,_ in inputs} | {n for n,_ in outputs}
-    local_candidates = (assigned | produced_by_module) - port_names
+    local_candidates = assigned - port_names
     local_decl = []
     for name in sorted(local_candidates):
         width = ''
@@ -283,7 +392,7 @@ def gen_extracted_module_from_dirs(whole_src, search_dirs, new_mod_name="extract
     return (
         header
         + ("    " + "\n    ".join(local_decl) + "\n" if local_decl else "")
-        + "  " + body.replace("\n", "\n  ")
+        + body.replace("\n", "\n")
         + "endmodule\n"
     )
 

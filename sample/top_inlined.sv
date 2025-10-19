@@ -24,6 +24,8 @@ module top(input logic clk, input logic rst);
 
   // ・reg 宣言も混ぜる
   reg flag;
+  logic [7:0] w1;
+  logic [3:0]ccc;
 
   // ・外部利用テスト用（extractブロックの出力のうち一部だけ参照）
   //   → eee と bus_out はブロック外で使う（出力ポートに採用されるべき）
@@ -46,7 +48,6 @@ module top(input logic clk, input logic rst);
   assign ccc_bit2 = ccc[2];
 
   
-logic [7:0] w1;
     // --- foo の複数インスタンス -------------------------
     // 1個目：典型パターン（切り出しルールの基本例）
     foo u_foo0(

@@ -275,3 +275,34 @@ def test_extract_slice_input_detected(tmp_path: Path):
     )
     assert "input [3:0] aaa" in out
     assert "output eee" in out
+
+
+def test_extract_slice_input_detected(tmp_path: Path):
+    """インスタンス接続 .AAA(aaa[3:2]) で base 'aaa' が input に入るかの単体チェック"""
+    write(tmp_path / "rtl/foo.sv", FOO_SV)
+    # 最小の top
+    src = """\
+    module top;
+      logic [3:0] aaa; logic bbb, ddd, eee; logic ccc_bit2;
+      logic x;
+      // @extract-begin
+      foo u0(
+        .AAA(aaa),
+      );
+      foo u0(
+        .EEE(aaa)
+      );
+      assign x = aaa & bbb;
+      // @extract-end
+    endmodule
+    """
+    write(tmp_path / "top.sv", src)
+
+    extract = load_extract_module()
+    out = extract.gen_extracted_module_from_dirs(
+        whole_src=(tmp_path / "top.sv").read_text(encoding="utf-8"),
+        search_dirs=[tmp_path / "rtl"],
+        new_mod_name="blk",
+    )
+    print(out)
+    assert "input [3:0] aaa" not in out
