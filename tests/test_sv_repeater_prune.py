@@ -63,7 +63,7 @@ def test_pow_replication_and_copy_indices(tmp_path):
       assign p_hoge_pow2[3:0] = {4{p_foo}};
       assign p_hoge_copy0 = p_hoge_pow1[0];
       assign p_hoge_copy3 = p_hoge_pow1[3];
-      assign p_hoge_copy6[1:0] = p_hoge_pow2[1:0];
+      assign p_hoge_copy6[1:0] = p_hoge_pow2[2:1];
     endmodule
     """)
     pat = r"(.*_pow\\d+|.*_copy\\d+)"
@@ -109,6 +109,7 @@ def test_slice_and_vector_copy(tmp_path):
     endmodule
     """)
     print(out)
+    assert out == expect
 
 
 

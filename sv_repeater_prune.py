@@ -240,6 +240,32 @@ def collapse_double_neg(expr: str) -> str:
         expr = DOUBLE_NEG_RE.sub('', expr)
     return expr
 
+def _compact_slice_from_parts(parts: List[str]) -> Optional[str]:
+    """Try to turn per-bit tokens back into a contiguous slice expression."""
+    if len(parts) < 2:
+        return None
+    parsed = []
+    for p in parts:
+        m = re.match(r'^([A-Za-z_]\w*)\[(\d+)\]$', p.strip())
+        if not m:
+            return None
+        parsed.append((m.group(1), int(m.group(2))))
+    names = {n for n, _ in parsed}
+    if len(names) != 1:
+        return None
+    deltas = [parsed[i+1][1] - parsed[i][1] for i in range(len(parsed)-1)]
+    if not deltas or any(d != deltas[0] for d in deltas):
+        return None
+    step = deltas[0]
+    if step not in (-1, 1):
+        return None
+    hi = parsed[0][1]
+    lo = parsed[-1][1]
+    if step == 1:  # ascending
+        hi, lo = parsed[-1][1], parsed[0][1]
+    name = parsed[0][0]
+    return f"{name}[{hi}:{lo}]"
+
 def _replace_token(tok: str, repl_table: Dict[str, str]) -> str:
     """Replace identifiers, including slice tokens, using per-bit table."""
     m = SLICE_RE.match(tok)
@@ -261,8 +287,20 @@ def _replace_token(tok: str, repl_table: Dict[str, str]) -> str:
             return parts[0]
         if all(p == parts[0] for p in parts):
             return f"{{{len(parts)}{{{parts[0]}}}}}"
+        compact = _compact_slice_from_parts(parts)
+        if compact:
+            return compact
         return "{" + ", ".join(parts) + "}"
     return repl_table.get(tok, tok)
+
+def _should_collapse_lhs(slice_m, new_rhs: str) -> bool:
+    expr = new_rhs.strip()
+    if not expr:
+        return False
+    # collapse when RHS is replication of a single token (no explicit comma)
+    if expr.startswith('{') and expr.endswith('}') and ',' not in expr:
+        return True
+    return False
 
 def replace_in_rhs_only(line: str, repl_table: Dict[str, str], decl_widths: Dict[str, str]) -> str:
     """
@@ -277,13 +315,6 @@ def replace_in_rhs_only(line: str, repl_table: Dict[str, str], decl_widths: Dict
     indent = line[:len(line) - len(line.lstrip())]
     lhs_render = lhs
     slice_m = SLICE_RE.match(lhs.strip())
-    if slice_m:
-        base = slice_m.group('name')
-        width = decl_widths.get(base)
-        if width:
-            slice_txt = f"[{slice_m.group('hi')}:{slice_m.group('lo')}]"
-            if width.replace(' ', '') == slice_txt.replace(' ', ''):
-                lhs_render = base
 
     def repl_token(match):
         tok = match.group(1)
@@ -291,6 +322,13 @@ def replace_in_rhs_only(line: str, repl_table: Dict[str, str], decl_widths: Dict
 
     new_rhs = IDENT_OR_INDEX_RE.sub(repl_token, rhs)
     new_rhs = collapse_double_neg(new_rhs)
+    if slice_m and _should_collapse_lhs(slice_m, new_rhs):
+        base = slice_m.group('name')
+        width = decl_widths.get(base)
+        if width:
+            slice_txt = f"[{slice_m.group('hi')}:{slice_m.group('lo')}]"
+            if width.replace(' ', '') == slice_txt.replace(' ', ''):
+                lhs_render = base
     suffix = f" {comment}" if comment else ""
     return f"{indent}assign {lhs_render} = {new_rhs};{suffix}"
 
