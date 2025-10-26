@@ -26,10 +26,12 @@ class PortInfo:
     width: str = ""
 
     def __iter__(self):
+        """Allow tuple-unpacking semantics (direction, width)."""
         yield self.direction
         yield self.width
 
     def __eq__(self, other):
+        """Support comparisons against other PortInfo instances or (dir, width) tuples."""
         if isinstance(other, PortInfo):
             return (self.direction, self.width) == (other.direction, other.width)
         if isinstance(other, tuple):
@@ -44,29 +46,35 @@ class SignalRecord:
     width: str = ""
 
     def update_width(self, width: str) -> None:
+        """Persist the first non-empty width that becomes available."""
         width = width.strip()
         if width and not self.width:
             self.width = width
 
     def mark_input(self, width: str) -> None:
+        """Mark the signal as an input unless it has already become an output."""
         if self.is_output:
             return
         self.is_input = True
         self.update_width(width)
 
     def clear_input(self) -> None:
+        """Drop the input flag (used when a signal upgrades to output)."""
         self.is_input = False
 
     def mark_output(self, width: str) -> None:
+        """Mark the signal as an output and inherit the provided width."""
         self.is_output = True
         self.clear_input()
         self.update_width(width)
 
 def read_module_src(mod_name: str, search_dirs: Union[Sequence[Union[str, Path]], str, Path]) -> str:
     """
-    search_dirs 内から mod_name.(sv|v) を探索して読み込む。
-    - 複数のディレクトリを順に探索
-    - 同名ファイルが複数の場所にあればエラー（曖昧性防止）
+    Locate `<mod_name>.sv|.v` under the provided directories and return its text.
+
+    The search mimics `-I` behaviour: iterate the directories, pick the first
+    existing match, and raise when multiple different files resolve to the same
+    module name to avoid silently pulling in the wrong definition.
     """
     if isinstance(search_dirs, (str, Path)):
         search_dirs = [search_dirs]
@@ -93,6 +101,13 @@ def read_module_src(mod_name: str, search_dirs: Union[Sequence[Union[str, Path]]
         return f.read()
 
 def split_with_markers(src: str):
+    """
+    Split the source string into `(pre, block, post)` segments using the
+    `// @extract-begin`/`// @extract-end` sentinels.
+
+    Raises:
+        ValueError: if either marker is missing or they are nested improperly.
+    """
     m1 = re.search(BEGIN, src)
     m2 = re.search(END, src)
     if not m1 or not m2 or m1.end() > m2.start():
@@ -103,7 +118,14 @@ def split_with_markers(src: str):
     return pre, block, post
 
 def parse_parent_decls(src: str):
-    """親ファイル中の logic|wire|reg 宣言を抽出（幅辞書を作成）"""
+    """
+    Return `{signal: width}` for every `wire|reg|logic` declaration in `src`.
+
+    Example:
+        logic signed [7:0] data0, data1;
+    produces `{"data0": "[7:0]", "data1": "[7:0]"}` which later lets us inherit
+    widths when promoting signals to ports.
+    """
     decls = {}
     decl_re = re.compile(
         r'^\s*(wire|reg|logic)\b(?:\s+signed\b)?\s*(\[[^\]]+\])?\s*([^;]+);\s*$',
@@ -120,6 +142,12 @@ def parse_parent_decls(src: str):
 
 # -- ヘルパ: "a, b[3], /*c*/ d" → ["a", "b", "d"]
 def _split_ident_list(idlist: str):
+    """
+    Split a comma-separated identifier list (which may contain comments, bit
+    slices, or initialisers) into clean base names.
+
+    Example: `"a, b[3], /* c */ d = 1'b0"` -> `["a", "b", "d"]`.
+    """
     s = strip_comments(idlist)
     names = []
     for tok in re.split(r'\s*,\s*', s.strip()):
@@ -131,9 +159,13 @@ def _split_ident_list(idlist: str):
 # -- ヘルパ: "input|output|inout ..." 形式の宣言ブロックから辞書を取る
 def _collect_ports_from_decl(text: str, prefer: str = 'first') -> Tuple[Dict[str, PortInfo], List[str]]:
     """
-    text 内にある input|output|inout 宣言を拾い、
-    {port: (dir, width)} と order を返す。複数名 (a, b, c) 対応。
-    prefer='first' のとき最初に見つけた定義を優先。
+    Parse a block of `input|output|inout` statements and build
+    `(port_dir, order)` collections.
+
+    Args:
+        text: chunk of Verilog containing one or more port declarations.
+        prefer: whether to keep the first occurrence (`'first'`) or allow later
+            declarations to overwrite earlier ones.
     """
     port_dir: Dict[str, PortInfo] = {}
     order: List[str] = []
@@ -159,8 +191,11 @@ def _collect_ports_from_decl(text: str, prefer: str = 'first') -> Tuple[Dict[str
 # -- ヘッダの (...) 部分だけを抜き出してパース
 def _parse_ports_from_header(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
-    module <name> ( ... ) ; の (...) を切り出し、
-    方向トークン input|output|inout ごとにセグメント化 → 疑似 ; を付けて共通パーサへ。
+    Extract ANSI-style port declarations from the `module (...) ;` header.
+
+    The function segments the parameter list by direction keyword, appends a
+    pseudo semicolon, and reuses `_collect_ports_from_decl` for the heavy
+    lifting.
     """
     header_port_dir: Dict[str, PortInfo] = {}
     header_order: List[str] = []
@@ -188,8 +223,9 @@ def _parse_ports_from_header(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
 # -- 本体部（endmodule まで）から non-ANSI 宣言をパース
 def _parse_ports_from_body(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
-    ヘッダ閉じ括弧 ');' 以降～対応する endmodule までを対象に、
-    non-ANSI の input|output|inout 行を収集。
+    Scan the module body (after the closing `);`) for non-ANSI
+    `input|output|inout` declarations and return the same `(port_dir, order)`
+    tuple as the header parser.
     """
     body_port_dir: Dict[str, PortInfo] = {}
     body_order: List[str] = []
@@ -217,10 +253,11 @@ def _parse_ports_from_body(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
 
 def parse_module_ports(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     """
-    1) ヘッダのポートリスト (ANSI) をパース
-    2) モジュール内部の宣言 (non-ANSI) をパース
-    3) 最後に統合（**ヘッダ優先**）
-       戻り値: (port_dir: {name: (dir, width)}, order: [name...])
+    Parse both ANSI header ports and non-ANSI body declarations, then merge
+    them into a single `{name: PortInfo}` dictionary plus an ordered list.
+
+    The header wins when both styles declare the same port so that modern code
+    does not get overridden by legacy repetitions.
     """
     header_dir, header_order = _parse_ports_from_header(src)
     body_dir,   body_order   = _parse_ports_from_body(src)
@@ -246,7 +283,15 @@ def parse_module_ports(src: str) -> Tuple[Dict[str, PortInfo], List[str]]:
     return port_dir, order
 
 def find_instances(block_src: str):
-    """ブロック内に現れるモジュールインスタンスのモジュール名集合"""
+    """
+    Return the set of module names instantiated inside the extraction block.
+
+    Example:
+        foo u0 (...);
+        bar u1 (...);
+    yields `{"foo", "bar"}` which we later use to parse callee port
+    definitions.
+    """
     mods = set()
     cleaned = strip_comments(block_src)
     for m in re.finditer(r'^\s*([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*\(', cleaned, flags=re.M):
@@ -255,13 +300,12 @@ def find_instances(block_src: str):
 
 def parse_instance_conns(block_src: str, mod_name: str) -> Dict[str, Set[str]]:
     """
-    インスタンスの .Port(expr) を {Port: set(base_signals)} に変換。
-    expr は識別子単体、スライス、インデックス付き、単純演算を許容。
-    例:
-      .AAA(aaa[3:2])
-      .BBB(bbb)
-      .CCC(ccc_bit2)
-      .DDD(a & b)
+    Convert `.Port(expr)` connections for `mod_name` into a dictionary of
+    `port -> {base_signal}`.
+
+    Only the base identifier matters (e.g. `.AAA(aaa[3:2])` -> `"aaa"`), so
+    slices, concatenations, and simple expressions are tolerated as long as we
+    can find identifier tokens inside them.
     """
     out: Dict[str, Set[str]] = {}
     inst_re = re.compile(
@@ -288,9 +332,12 @@ def parse_instance_conns(block_src: str, mod_name: str) -> Dict[str, Set[str]]:
 
 def collect_assign_rw(block_src: str) -> Tuple[Set[str], Set[str]]:
     """
-    assign 文から LHS 集合・RHS 集合（ベース名）を抽出する。
-    LHS: assign LHS = ...
-    RHS: 右辺に現れる識別子（スライス/添字付きはベース名に還元）
+    Return `(lhs_set, rhs_set)` for every `assign` statement in the block.
+
+    Example:
+        assign foo[3:0] = bar[3:0] & baz;
+    yields `lhs_set={"foo"}` and `rhs_set={"bar", "baz"}` which later drive
+    input/output inference.
     """
     lhs_set: Set[str] = set()
     rhs_set: Set[str] = set()
@@ -317,7 +364,13 @@ def collect_assign_rw(block_src: str) -> Tuple[Set[str], Set[str]]:
     return lhs_set, rhs_set
 
 def extract_used_lines(outside_text: str) -> str:
-    # コメント削除
+    """
+    Strip comments and declaration headers from the outside text so that
+    `token_used_outside` can perform a simple regex lookup.
+
+    Declarations with initialisers keep only their RHS expressions because they
+    behave more like executable logic.
+    """
     text = strip_comments(outside_text)
 
     processed_lines = []
@@ -339,11 +392,11 @@ def extract_used_lines(outside_text: str) -> str:
 
 def token_used_outside(name: str, used_lines: str) -> bool:
     """
-    outside_text で name が使われているかを判定。
-    以下はカウントしない：
-      - コメント中（//, /* ... */）
-      - 宣言行の宣言部分 (wire|reg|logic)
-        - ただし宣言に初期化が付いている場合は RHS 内の使用は残す
+    True if `name` shows up in the pre/post sections outside the extract block.
+
+    The helper assumes `used_lines` has already had comments and declaration
+    headers stripped via `extract_used_lines`, so a simple regex is sufficient
+    here.
     """
     return re.search(rf'\b{re.escape(name)}\b', used_lines) is not None
 
@@ -352,6 +405,10 @@ def token_used_outside(name: str, used_lines: str) -> bool:
 # --------------------------------------------------
 
 def resolve_width(sig: str, parent_decl: Dict[str, str], port_width: str) -> str:
+    """
+    Choose the best-known width string for `sig`, preferring parent declarations
+    over callee port widths, and defaulting to scalar when nothing matches.
+    """
     for candidate in (parent_decl.get(sig, ''), port_width or ''):
         candidate = (candidate or '').strip()
         if candidate:
@@ -359,6 +416,19 @@ def resolve_width(sig: str, parent_decl: Dict[str, str], port_width: str) -> str
     return ''
 
 def gen_extracted_module_from_dirs(whole_src: str, search_dirs, new_mod_name: str = "extracted_mod") -> str:
+    """
+    Generate a new module body from the marked extract block.
+
+    The routine orchestrates the entire analysis pipeline:
+      1. locate the block and capture surrounding text
+      2. gather parent declarations and assignment usage
+      3. parse instantiated modules to infer I/O intent
+      4. classify signals into inputs, outputs, or local declarations
+      5. render a self-contained module named `new_mod_name`
+
+    Returns:
+        SystemVerilog source code for the extracted module.
+    """
     pre, block, post = split_with_markers(whole_src)
     outside = pre + post
     parent_decl = parse_parent_decls(whole_src)
@@ -458,6 +528,7 @@ def gen_extracted_module_from_dirs(whole_src: str, search_dirs, new_mod_name: st
 # --------------------------------------------------
 
 def main():
+    """CLI entrypoint: parse args, run the extractor, and emit the new module."""
     ap = argparse.ArgumentParser(
         description="Extract a marked block into a new module. "
                     "Search module definitions in given directories."
