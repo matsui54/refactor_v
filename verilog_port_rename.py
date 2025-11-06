@@ -467,8 +467,7 @@ def main():
         module_path = args.module_file
     else:
         # ファイル名が無い場合は標準入力から読む
-        if not sys.stdin.isatty():
-            # ユーザ指定: isatty() でなければ help を出して終了
+        if sys.stdin.isatty():
             parser.print_help(sys.stderr)
             raise SystemExit(1)
         module_text = sys.stdin.read()
