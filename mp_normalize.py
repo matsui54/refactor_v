@@ -24,7 +24,7 @@
 
 import argparse
 import re
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Optional
 
 # assign m_hoge[... ] = ~( ... );
 RE_ASSIGN_M = re.compile(
@@ -73,10 +73,47 @@ def strip_outer_parens(expr: str) -> str:
     return expr
 
 
+def _extract_negated_rhs(line: str) -> Optional[str]:
+    """
+    line に含まれる RHS が ~( ... ) だけで構成されている場合に
+    カッコの中身を返す。そうでなければ None。
+    """
+    code = line.split('//', 1)[0]
+    if '=' not in code or ';' not in code:
+        return None
+
+    eq_idx = code.find('=')
+    semi_idx = code.rfind(';')
+    if semi_idx == -1 or semi_idx <= eq_idx:
+        return None
+
+    rhs = code[eq_idx + 1:semi_idx].strip()
+    if not rhs.startswith('~'):
+        return None
+    rhs = rhs[1:].lstrip()
+    if not rhs.startswith('('):
+        return None
+
+    rhs = rhs[1:]
+    depth = 1
+    for idx, ch in enumerate(rhs):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                inner = rhs[:idx].strip()
+                rest = rhs[idx + 1:].strip()
+                if rest:
+                    return None
+                return inner
+    return None
+
+
 def collect_info(lines: List[str]):
     """1パス目: m_/p_ の情報を収集する。"""
-    # base -> (line_idx, rhs_expr)
-    m_assigns: Dict[str, Tuple[int, str]] = {}
+    # base -> [(line_idx, rhs_expr), ...]
+    m_assigns: Dict[str, List[Tuple[int, str]]] = {}
     # base -> (line_idx, m_name_in_rhs)
     p_from_m: Dict[str, Tuple[int, str]] = {}
     # p_hoge の base 集合
@@ -86,8 +123,10 @@ def collect_info(lines: List[str]):
         m = RE_ASSIGN_M.match(line)
         if m:
             base = m.group('base')
-            rhs = m.group('rhs')
-            m_assigns[base] = (idx, rhs)
+            rhs_expr = _extract_negated_rhs(line)
+            if rhs_expr is None:
+                continue
+            m_assigns.setdefault(base, []).append((idx, rhs_expr))
 
         m2 = RE_ASSIGN_P_FROM_M.match(line)
         if m2:
@@ -202,7 +241,7 @@ def transform(lines: List[str]) -> List[str]:
     new_lines = list(lines)
 
     # --- case1: m_assign のうち pair_bases でない & p がまだ存在しないもの ---
-    for base, (idx, rhs) in m_assigns.items():
+    for base, assigns in m_assigns.items():
         if base in pair_bases:
             continue  # case2 で処理する
 
@@ -210,28 +249,35 @@ def transform(lines: List[str]) -> List[str]:
             # すでに p_hoge があるなら何もしない
             continue
 
-        line = lines[idx]
-        m = RE_ASSIGN_M.match(line)
-        if not m:
-            continue
+        rewrite_done = False
+        for idx, rhs in assigns:
+            line = lines[idx]
+            m = RE_ASSIGN_M.match(line)
+            if not m:
+                continue
 
-        comment = m.group('comment') or ''
-        indent = line[:line.index('assign')] if 'assign' in line else ''
-        idx_part = m.group('idx') or ''  # "[3:0]" など
+            comment = m.group('comment') or ''
+            indent = line[:line.index('assign')] if 'assign' in line else ''
+            idx_part = m.group('idx') or ''  # "[3:0]" など
 
-        new_lhs = f"p_{base}{idx_part}"
-        new_rhs = strip_outer_parens(rhs)
-        new_line = f"{indent}assign {new_lhs} = {new_rhs};"
-        if comment:
-            new_line += f" {comment}"
-        new_line += "\n"
-        new_lines[idx] = new_line
+            new_lhs = f"p_{base}{idx_part}"
+            new_rhs = strip_outer_parens(rhs)
+            new_line = f"{indent}assign {new_lhs} = {new_rhs};"
+            if comment:
+                new_line += f" {comment}"
+            new_line += "\n"
+            new_lines[idx] = new_line
+            rewrite_done = True
 
-        rename_bases.add(base)
+        if rewrite_done:
+            rename_bases.add(base)
 
     # --- case2: m & p のペアがある base ---
     for base in pair_bases:
-        m_idx, m_rhs = m_assigns[base]
+        assigns = m_assigns.get(base)
+        if not assigns:
+            continue
+        m_idx, m_rhs = assigns[0]
         p_idx, m_name_in_p = p_from_m[base]
 
         # m_idx 行を削除

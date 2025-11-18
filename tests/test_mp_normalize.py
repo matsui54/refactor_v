@@ -137,3 +137,50 @@ def test_mixed_declaration_rename_and_delete():
     """
     out = _run_transform(src)
     _assert_verilog_equal(out, expected)
+
+
+def test_0():
+    src = """
+    module top;
+      wire m_foo, m_bar;
+      assign m_foo = ~((a &b) & ~(a|~b));
+      assign m_bar = ~b & a;
+      assign y = m_foo & m_bar;
+    endmodule
+    """
+    expected = """
+    module top;
+      wire p_foo, m_bar;
+      assign p_foo = (a &b) & ~(a|~b);
+      assign m_bar = ~b & a;
+      assign y = ~p_foo & m_bar;
+    endmodule
+    """
+    out = _run_transform(src)
+    _assert_verilog_equal(out, expected)
+
+
+def test_1():
+    src = """
+    module top;
+      logic [3:0] m_foo;
+      logic [3:0] a, b;
+      assign m_foo[3:2] = ~(a[3:2] & ~b[3:2]);
+      assign m_foo[1:0] = ~(a[1:0] & b[1:0]);
+      assign m_bar = ~b & a;
+      assign y = m_foo & {4{m_bar}};
+    endmodule
+    """
+    expected = """
+    module top;
+      logic [3:0] p_foo;
+      logic [3:0] a, b;
+      assign p_foo[3:2] = a[3:2] & ~b[3:2];
+      assign p_foo[1:0] = a[1:0] & b[1:0];
+      assign m_bar = ~b & a;
+      assign y = ~p_foo & {4{m_bar}};
+    endmodule
+    """
+    out = _run_transform(src)
+    print(out)
+    _assert_verilog_equal(out, expected)
