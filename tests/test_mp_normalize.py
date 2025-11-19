@@ -182,5 +182,75 @@ def test_1():
     endmodule
     """
     out = _run_transform(src)
+    _assert_verilog_equal(out, expected)
+
+
+# def test_2():
+#     src = """
+#     module top;
+#       logic [3:0] p_foo;
+#       logic [3:0] m_foo;
+#       logic [3:0] a, x, c, d;
+#       assign p_foo = c | d;
+#       assign m_foo = ~p_foo;
+#       assign x = a & ~m_foo;
+#     endmodule
+#     """
+#     expected = """
+#     module top;
+#       logic [3:0] p_foo;
+#       logic [3:0] a, x, c, d;
+#       assign p_foo = c | d;
+#       assign x = a & p_foo;
+#     endmodule
+#     """
+#     out = _run_transform(src)
+#     print(out)
+#     _assert_verilog_equal(out, expected)
+
+
+def test_3():
+    src = """
+    module top;
+      logic [3:0] m_foo;
+      logic [3:0] a, x, b, c;
+      assign m_foo = ~(c & b);
+      assign x = a & ~m_foo;
+    endmodule
+    """
+    expected = """
+    module top;
+      logic [3:0] p_foo;
+      logic [3:0] a, x, b, c;
+      assign p_foo = c & b;
+      assign x = a & p_foo;
+    endmodule
+    """
+    out = _run_transform(src)
+    print(out)
+    _assert_verilog_equal(out, expected)
+
+
+def test_4():
+    src = """
+    module top;
+      logic [3:0] m_hoge;
+      logic [3:0] p_hoge;
+      logic [3:0] a, b;
+      assign m_hoge[55:30] = ~(a[55:30] | b[55:30]);
+      assign m_hoge[25:0] = ~(a[25:0] | b[25:0]);
+      assign p_hoge[25:0] = ~m_hoge[20:0];
+      assign p_hoge[55:30] = ~m_hoge[55:30];
+    endmodule
+    """
+    expected = """
+    module top;
+      logic [3:0] p_hoge;
+      logic [3:0] a, b;
+      assign p_hoge[55:30] = a[55:30] | b[55:30];
+      assign p_hoge[25:0] = a[25:0] | b[25:0];
+    endmodule
+    """
+    out = _run_transform(src)
     print(out)
     _assert_verilog_equal(out, expected)

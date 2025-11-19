@@ -112,10 +112,10 @@ def _extract_negated_rhs(line: str) -> Optional[str]:
 
 def collect_info(lines: List[str]):
     """1パス目: m_/p_ の情報を収集する。"""
-    # base -> [(line_idx, rhs_expr), ...]
-    m_assigns: Dict[str, List[Tuple[int, str]]] = {}
-    # base -> (line_idx, m_name_in_rhs)
-    p_from_m: Dict[str, Tuple[int, str]] = {}
+    # base -> [(line_idx, rhs_expr, idx_text), ...]
+    m_assigns: Dict[str, List[Tuple[int, str, str]]] = {}
+    # base -> [line_idx, ...]
+    p_from_m: Dict[str, List[int]] = {}
     # p_hoge の base 集合
     existing_p_bases: Set[str] = set()
 
@@ -126,13 +126,13 @@ def collect_info(lines: List[str]):
             rhs_expr = _extract_negated_rhs(line)
             if rhs_expr is None:
                 continue
-            m_assigns.setdefault(base, []).append((idx, rhs_expr))
+            idx_part = m.group('idx') or ''
+            m_assigns.setdefault(base, []).append((idx, rhs_expr, idx_part))
 
         m2 = RE_ASSIGN_P_FROM_M.match(line)
         if m2:
             base = m2.group('base')
-            mrhs = m2.group('mrhs')
-            p_from_m[base] = (idx, mrhs)
+            p_from_m.setdefault(base, []).append(idx)
 
         # p_ の存在検出
         for m3 in RE_P_NAME.finditer(line):
@@ -250,15 +250,14 @@ def transform(lines: List[str]) -> List[str]:
             continue
 
         rewrite_done = False
-        for idx, rhs in assigns:
-            line = lines[idx]
+        for line_idx, rhs, idx_part in assigns:
+            line = lines[line_idx]
             m = RE_ASSIGN_M.match(line)
             if not m:
                 continue
 
             comment = m.group('comment') or ''
             indent = line[:line.index('assign')] if 'assign' in line else ''
-            idx_part = m.group('idx') or ''  # "[3:0]" など
 
             new_lhs = f"p_{base}{idx_part}"
             new_rhs = strip_outer_parens(rhs)
@@ -266,7 +265,7 @@ def transform(lines: List[str]) -> List[str]:
             if comment:
                 new_line += f" {comment}"
             new_line += "\n"
-            new_lines[idx] = new_line
+            new_lines[line_idx] = new_line
             rewrite_done = True
 
         if rewrite_done:
@@ -274,32 +273,27 @@ def transform(lines: List[str]) -> List[str]:
 
     # --- case2: m & p のペアがある base ---
     for base in pair_bases:
-        assigns = m_assigns.get(base)
+        assigns = m_assigns.get(base) or []
         if not assigns:
             continue
-        m_idx, m_rhs = assigns[0]
-        p_idx, m_name_in_p = p_from_m[base]
 
-        # m_idx 行を削除
-        new_lines[m_idx] = ""
+        for line_idx, rhs, idx_part in assigns:
+            original_line = lines[line_idx]
+            m = RE_ASSIGN_M.match(original_line)
+            if not m:
+                continue
+            comment = m.group('comment') or ''
+            indent = original_line[:original_line.index('assign')] if 'assign' in original_line else ''
+            new_lhs = f"p_{base}{idx_part}"
+            new_rhs = strip_outer_parens(rhs)
+            new_line = f"{indent}assign {new_lhs} = {new_rhs};"
+            if comment:
+                new_line += f" {comment}"
+            new_line += "\n"
+            new_lines[line_idx] = new_line
 
-        # p_idx 行を書き換え
-        line_p = lines[p_idx]
-        m2 = RE_ASSIGN_P_FROM_M.match(line_p)
-        if not m2:
-            continue
-
-        comment = m2.group('comment') or ''
-        indent = line_p[:line_p.index('assign')] if 'assign' in line_p else ''
-        idx_part = m2.group('idx') or ''
-
-        new_lhs = f"p_{base}{idx_part}"
-        new_rhs = strip_outer_parens(m_rhs)  # m_hoge[...] = ~(m_rhs) → p_hoge[...] = m_rhs;
-        new_line = f"{indent}assign {new_lhs} = {new_rhs};"
-        if comment:
-            new_line += f" {comment}"
-        new_line += "\n"
-        new_lines[p_idx] = new_line
+        for p_idx in p_from_m.get(base, []):
+            new_lines[p_idx] = ""
 
     # --- 宣言行の書き換え ---
     # rename_bases: m_base → p_base にリネーム
@@ -314,18 +308,34 @@ def transform(lines: List[str]) -> List[str]:
 
     for base in elim_bases:
         # m_hoge[...]
-        pattern = re.compile(
-            rf'\b(m_{re.escape(base)})(\[[^\]]+\])?'
+        base_pattern = rf'm_{re.escape(base)}'
+        idx_pattern = r'(\[[^\]]+\])?'
+
+        pattern_neg_paren = re.compile(
+            rf'~\s*\(\s*({base_pattern}){idx_pattern}\s*\)'
+        )
+        pattern_neg_direct = re.compile(
+            rf'~\s*({base_pattern})\b{idx_pattern}'
+        )
+        pattern_plain = re.compile(
+            rf'\b({base_pattern})\b{idx_pattern}'
         )
 
-        def repl(match: re.Match) -> str:
+        def repl_negated(match: re.Match) -> str:
+            idx_part = match.group(2) or ''
+            return f"p_{base}{idx_part}"
+
+        def repl_plain(match: re.Match) -> str:
             idx_part = match.group(2) or ''
             return f"~p_{base}{idx_part}"
 
         for i, line in enumerate(new_lines):
             if not line:
                 continue
-            new_lines[i] = pattern.sub(repl, line)
+            updated = pattern_neg_paren.sub(repl_negated, line)
+            updated = pattern_neg_direct.sub(repl_negated, updated)
+            updated = pattern_plain.sub(repl_plain, updated)
+            new_lines[i] = updated
 
     return new_lines
 
